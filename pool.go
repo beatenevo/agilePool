@@ -19,6 +19,7 @@ const (
 	defaultStatsSamplePeriod    = 100 * time.Millisecond
 	defaultStatsWindowSize      = 10
 	defaultScalerPeriod         = 10 * time.Millisecond
+	defaultBacklogDecayFactor   = 0.3
 )
 
 type WorkMode int8
@@ -373,14 +374,18 @@ func (p *Pool) scaleIfNeeded() {
 		target = int64(submitMed * float64(running) / consumeMed)
 	}
 
-	// Queue-based override: handle backlogs and cold starts aggressively.
+	// Queue-weighted target: treat backlog as additional incoming tasks.
+	// decayFactor controls how aggressively we drain the queue per tick
+	// (e.g. 0.3 means 30% of the queue is factored in as extra "submissions"
+	// each scaler tick, so deep backlogs keep the target elevated).
 	if queueDepth > 0 {
 		if running == 0 {
 			// Cold start: spawn enough to drain the backlog (up to capacity).
 			target = queueDepth
 		} else if consumeMed > 0 {
-			// Running with data: scale to clear the backlog.
-			qTarget := int64(float64(queueDepth) * float64(running) / consumeMed)
+			decayFactor := p.config.backlogDecayFactor
+			effectiveSubmit := submitMed + float64(queueDepth)*decayFactor
+			qTarget := int64(effectiveSubmit * float64(running) / consumeMed)
 			if qTarget > target {
 				target = qTarget
 			}
