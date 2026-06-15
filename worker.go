@@ -53,14 +53,13 @@ loop:
 			w.runTask(task)
 
 		default:
-			// Acquire pool lock and re-check the queue atomically.
-			// This serializes the "decide to exit" decision with Submit's slow-path
-			// push, so a task pushed concurrently cannot be stranded in the queue
-			// after this worker decrements runningWorkersNum.
-			w.pool.lock.Lock()
+			// Lock-free second check: catch tasks that arrived in the
+			// tiny window between the two select polls. Submit no longer
+			// holds p.lock, so serialisation via lock is unnecessary.
+			// If a task slips through both selects, the scaler will
+			// spawn workers within scalerPeriod (10ms) to pick it up.
 			select {
 			case task, ok := <-w.pool.taskQueue:
-				w.pool.lock.Unlock()
 				if !ok {
 					w.pool.logger.Println("taskQueue closed,exiting")
 					w.pool.addRunningWorkersNum(-1)
@@ -78,11 +77,11 @@ loop:
 				w.lastActiveAt = time.Now()
 				w.runTask(task)
 			default:
-				// w is being parked in idleWorks; do NOT also put it in
-				// workerPool.sync.Pool — see the note at the top of run().
+				// Parking: no task found in second check, worker goes idle.
+				// Do NOT also put w in workerPool.sync.Pool — see the
+				// note at the top of run().
 				w.pool.addRunningWorkersNum(-1)
 				atomic.AddInt64(&w.pool.exitCount, 1)
-				w.pool.lock.Unlock()
 				w.pool.addToIdle(w)
 				break loop
 			}
