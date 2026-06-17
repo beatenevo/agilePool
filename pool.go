@@ -31,6 +31,11 @@ const (
 	// buffer. Small, fixed-size chunks avoid the ~2× memory overhead of a
 	// single dynamically-growing slice and reduce GC pressure.
 	taskChunkSize = 4096
+
+	// maxChunkLen caps the total number of tasks in the chunked buffer.
+	// When reached, submitters block on the handoff channel instead of
+	// growing the buffer further, bounding peak memory.
+	maxChunkLen = 100_000
 )
 
 type WorkMode int8
@@ -225,6 +230,16 @@ func (p *Pool) submit(ctx context.Context, task Task) {
 		p.wg.Done()
 		return
 	}
+
+	// Backpressure: when the chunked buffer exceeds maxChunkLen, block
+	// on the handoff channel instead of growing the buffer further.
+	// This gives workers time to drain and bounds peak memory.
+	if p.chunkLen >= maxChunkLen {
+		p.taskMu.Unlock()
+		p.taskQueue <- task // block until a worker picks up
+		return
+	}
+
 	p.pushTail(task)
 	// Forward: pop from head and try to send to handoff channel.
 	// This wakes a polling worker immediately without waiting for
