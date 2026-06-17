@@ -1,6 +1,7 @@
 package agilepool
 
 import (
+	"sync/atomic"
 	"time"
 )
 
@@ -36,6 +37,7 @@ loop:
 			if !ok {
 				w.pool.logger.Println("taskQueue closed,exiting")
 				w.pool.addRunningWorkersNum(-1)
+				atomic.AddInt64(&w.pool.exitCount, 1)
 				w.pool.workerPool.Put(w)
 				return
 			}
@@ -43,6 +45,7 @@ loop:
 			if task == nil {
 				w.pool.logger.Println("nil task received, exiting")
 				w.pool.addRunningWorkersNum(-1)
+				atomic.AddInt64(&w.pool.exitCount, 1)
 				w.pool.workerPool.Put(w)
 				return
 			}
@@ -50,35 +53,58 @@ loop:
 			w.runTask(task)
 
 		default:
-			// Acquire pool lock and re-check the queue atomically.
-			// This serializes the "decide to exit" decision with Submit's slow-path
-			// push, so a task pushed concurrently cannot be stranded in the queue
-			// after this worker decrements runningWorkersNum.
-			w.pool.lock.Lock()
+			// Try taskBuf before the second channel check so workers
+			// drain the primary queue directly without a drainer goroutine.
+			// Grab a batch of up to 8 tasks per lock acquisition to
+			// amortise the mutex overhead across multiple tasks and
+			// reduce contention with the submission path.
+			const batchSize = 8
+			var batch [batchSize]Task
+			n := 0
+			w.pool.taskMu.Lock()
+			for n < batchSize && len(w.pool.taskBuf) > 0 {
+				batch[n] = w.pool.taskBuf[0]
+				w.pool.taskBuf = w.pool.taskBuf[1:]
+				n++
+			}
+			w.pool.taskMu.Unlock()
+			for i := 0; i < n; i++ {
+				w.lastActiveAt = time.Now()
+				w.runTask(batch[i])
+			}
+			if n > 0 {
+				continue
+			}
+
+			// Lock-free second check: catch tasks that arrived in the
+			// tiny window between the two select polls. Submit no longer
+			// holds p.lock, so serialisation via lock is unnecessary.
+			// If a task slips through both selects, the scaler will
+			// spawn workers within scalerPeriod (10ms) to pick it up.
 			select {
 			case task, ok := <-w.pool.taskQueue:
-				w.pool.lock.Unlock()
 				if !ok {
 					w.pool.logger.Println("taskQueue closed,exiting")
 					w.pool.addRunningWorkersNum(-1)
+					atomic.AddInt64(&w.pool.exitCount, 1)
 					w.pool.workerPool.Put(w)
 					return
 				}
 				if task == nil {
 					w.pool.logger.Println("nil task received, exiting")
 					w.pool.addRunningWorkersNum(-1)
+					atomic.AddInt64(&w.pool.exitCount, 1)
 					w.pool.workerPool.Put(w)
 					return
 				}
 				w.lastActiveAt = time.Now()
 				w.runTask(task)
 			default:
-				// Decrement under lock so the safety net sees an accurate
-				// count.  Park (addToIdle) outside the lock to minimise
-				// the time p.lock is held — addToIdle uses its own muIdle
-				// mutex, so nesting it here only amplifies Unlock contention.
+				// Parking: no task found in second check, worker goes idle.
+				// Do NOT also put w in workerPool.sync.Pool — see the
+				// note at the top of run().
 				w.pool.addRunningWorkersNum(-1)
-				w.pool.lock.Unlock()
+				atomic.AddInt64(&w.pool.exitCount, 1)
 				w.pool.addToIdle(w)
 				break loop
 			}
@@ -87,6 +113,7 @@ loop:
 }
 
 func (w *worker) runTask(task Task) {
+	atomic.AddInt64(&w.pool.consumeCount, 1)
 	defer func() {
 		if p := recover(); p != nil {
 			w.pool.logger.Printf("worker exits from panic: %v\n%s\n", p, Stack(1))

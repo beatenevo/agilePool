@@ -12,10 +12,20 @@ import (
 
 const (
 	defaultCleanPeriod          = 500 * time.Millisecond
-	defaultTaskQueueSize        = 10000
+	defaultTaskQueueSize        = 200000
 	defaultMaxWorkerNumCapacity = math.MaxInt64
 	defaultWorkMode             = BLOCK
 	defaultIdleContainerType    = LinkedListType
+	defaultStatsSamplePeriod    = 100 * time.Millisecond
+	defaultStatsWindowSize      = 10
+	defaultScalerPeriod         = 10 * time.Millisecond
+	defaultBacklogDecayFactor   = 0.3
+
+	// internalTaskQueueCap is the fixed capacity of the internal handoff
+	// channel. It is small and NOT user-configurable — workers pull from
+	// taskBuf for the bulk of queued tasks, so channel capacity does not
+	// couple memory usage or scaler behaviour to the queue-size setting.
+	internalTaskQueueCap = 64
 )
 
 type WorkMode int8
@@ -65,6 +75,21 @@ type Pool struct {
 	// over the pool lifetime. For the number of currently active workers,
 	// use GetRunningWorkersNum().
 	workerCreateCount int64
+
+	// ---- task queue (small handoff channel + dynamically-grown buffer) ----
+	taskBuf        []Task     // primary queue, grows on demand
+	taskMu         sync.Mutex // protects taskBuf
+	overflowClosed bool       // prevents spool after Close
+
+	// ---- rate statistics for adaptive scaling ----
+	submitCount  int64 // atomic, tasks submitted per window
+	consumeCount int64 // atomic, tasks consumed per window
+	exitCount    int64 // atomic, goroutines exited per window
+
+	statMu      sync.Mutex
+	submitHist  *histogram // submit count distribution per window
+	consumeHist *histogram // consume count distribution per window
+	exitHist    *histogram // exit count distribution per window
 }
 
 func NewPool(c *Config) *Pool {
@@ -77,7 +102,8 @@ func NewPool(c *Config) *Pool {
 		lock:        &sync.Mutex{},
 		logger:      log.Default(),
 		capacity:    c.workerNumCapacity,
-		taskQueue:   make(chan Task, c.taskQueueSize),
+		taskQueue:   make(chan Task, internalTaskQueueCap),
+		taskBuf:     make([]Task, 0, 64),
 	}
 
 	switch c.idleContainerType {
@@ -93,6 +119,10 @@ func NewPool(c *Config) *Pool {
 
 	atomic.StoreInt64(&p.workerCreateCount, 0)
 
+	p.submitHist = newHistogram(submitBuckets, c.statsWindowSize)
+	p.consumeHist = newHistogram(consumeBuckets, c.statsWindowSize)
+	p.exitHist = newHistogram(exitBuckets, c.statsWindowSize)
+
 	p.workerPool.New = func() interface{} {
 		atomic.AddInt64(&p.workerCreateCount, 1)
 		w := &worker{
@@ -102,6 +132,8 @@ func NewPool(c *Config) *Pool {
 	}
 
 	go p.expiredWorkerCleaner()
+	go p.statsSampler()
+	go p.scaler()
 	defaultPool.Store(p)
 	return p
 }
@@ -139,63 +171,56 @@ func (p *Pool) SubmitCtx(ctx context.Context, task Task) {
 }
 
 func (p *Pool) submit(ctx context.Context, task Task) {
-	// Reject new submissions once Close has been called. We check before
-	// wg.Add so that a closed pool's Wait() can still return promptly for
-	// in-flight tasks and is not blocked by post-close submissions.
 	if atomic.LoadInt32(&p.closed) == 1 {
 		return
 	}
+	atomic.AddInt64(&p.submitCount, 1)
 	p.wg.Add(1)
-	p.lock.Lock()
 
-	if atomic.LoadInt64(&p.runningWorkersNum) < p.capacity {
-		p.addRunningWorkersNum(1)
-		p.lock.Unlock()
-		p.muIdle.Lock()
-		w := p.idleWorks.Pop()
-		p.muIdle.Unlock()
-		if w != nil {
-			go w.run(task)
-		} else {
-			w := p.workerPool.Get().(*worker)
-			go w.run(task)
-		}
-		return
-	}
-	p.lock.Unlock()
-	if p.config.workMode == NONBLOCK {
-		p.wg.Done()
-		return
-	}
-
-	select {
-	case p.taskQueue <- task:
-	case <-ctx.Done():
-		p.wg.Done()
-		return
-	}
-
-	// Safety net: if workers exited between our capacity check and the push
-	// above, tasks could be stranded in the channel buffer with no consumer.
-	// Re-check under lock and spawn enough workers to drain the queue, up to
-	// capacity. See TestQueueStuckRace for the race this guards against.
-	p.lock.Lock()
-	running := atomic.LoadInt64(&p.runningWorkersNum)
-	target := int64(len(p.taskQueue))
-	if target > p.capacity {
-		target = p.capacity
-	}
-	toSpawn := target - running
-	if toSpawn > 0 {
-		p.addRunningWorkersNum(toSpawn)
-		p.lock.Unlock()
-		for i := int64(0); i < toSpawn; i++ {
+	// Cold start: if no goroutine is running, spawn one immediately.
+	if atomic.LoadInt64(&p.runningWorkersNum) == 0 {
+		if atomic.CompareAndSwapInt64(&p.runningWorkersNum, 0, 1) {
 			w := p.workerPool.Get().(*worker)
 			go w.run(nil)
 		}
+	}
+
+	if p.config.workMode == NONBLOCK {
+		select {
+		case p.taskQueue <- task:
+		default:
+			p.wg.Done()
+		}
 		return
 	}
-	p.lock.Unlock()
+
+	// Try fast path: push to channel directly.
+	select {
+	case p.taskQueue <- task:
+		return
+	default:
+	}
+
+	// Channel full -> spool to overflow (never blocks the caller).
+	p.taskMu.Lock()
+	if p.overflowClosed {
+		p.taskMu.Unlock()
+		p.wg.Done()
+		return
+	}
+	p.taskBuf = append(p.taskBuf, task)
+	// Try to forward head of buf to the handoff channel — this wakes
+	// a polling worker immediately without waiting for the next scaler
+	// tick. If the channel is still full a worker is already busy and
+	// will check buf on its next poll iteration.
+	if len(p.taskBuf) > 0 {
+		select {
+		case p.taskQueue <- p.taskBuf[0]:
+			p.taskBuf = p.taskBuf[1:]
+		default:
+		}
+	}
+	p.taskMu.Unlock()
 }
 
 type contextTask struct {
@@ -275,6 +300,244 @@ func (p *Pool) expiredWorkerCleaner() {
 	}
 }
 
+// statsSampler samples the rate counters periodically and records them into
+// the sliding-window histories.
+func (p *Pool) statsSampler() {
+	ticker := time.NewTicker(p.config.statsSamplePeriod)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			p.sampleRates()
+		case <-p.closePoolCn:
+			return
+		}
+	}
+}
+
+func (p *Pool) sampleRates() {
+	sub := atomic.SwapInt64(&p.submitCount, 0)
+	con := atomic.SwapInt64(&p.consumeCount, 0)
+	ext := atomic.SwapInt64(&p.exitCount, 0)
+
+	p.statMu.Lock()
+	defer p.statMu.Unlock()
+
+	p.submitHist.add(sub)
+	p.consumeHist.add(con)
+	p.exitHist.add(ext)
+}
+
+func (p *Pool) scaleIfNeeded() {
+	submitMed, consumeMed, exitMed := p.getMedianRates()
+	running := atomic.LoadInt64(&p.runningWorkersNum)
+
+	// Read buf depth under its lock so the scaler sees task backlog.
+	p.taskMu.Lock()
+	bufDepth := int64(len(p.taskBuf))
+	p.taskMu.Unlock()
+
+	// totalBacklog sums buf (primary queue) and channel occupancy.
+	// The channel is fixed at internalTaskQueueCap (64), so its
+	// contribution is bounded and does not couple scaler behaviour
+	// to user configuration. It is still needed to prevent a task
+	// that was forwarded buf→channel from being orphaned when the
+	// worker goes idle while the channel still holds work.
+	totalBacklog := bufDepth + int64(len(p.taskQueue))
+
+	var target int64
+
+	// Rate-based target: target = b / a = submitMed * running / consumeMed
+	if running > 0 && consumeMed > 0 && submitMed > 0 {
+		target = int64(submitMed * float64(running) / consumeMed)
+	}
+
+	// Backlog-weighted target: treat backlog as additional incoming tasks.
+	// decayFactor is dynamically adjusted by bufPressure — when the overflow
+	// buffer is deep relative to the drain rate, the scaler becomes more
+	// aggressive; when it's shallow, the configured decayFactor dominates.
+	if totalBacklog > 0 {
+		if running == 0 {
+			// Cold start: spawn enough to drain the backlog (up to capacity).
+			target = totalBacklog
+		} else if consumeMed > 0 {
+			// bufPressure ∈ [0,1]: how many 100ms cycles needed to drain buf alone.
+			bufCycles := float64(bufDepth) / consumeMed
+			bufPressure := min(1.0, bufCycles*0.15)
+
+			// dynamicDecay ∈ [decayFactor, 1.0].
+			dynamicDecay := p.config.backlogDecayFactor +
+				(1-p.config.backlogDecayFactor)*bufPressure
+
+			effectiveSubmit := submitMed + float64(totalBacklog)*dynamicDecay
+			qTarget := int64(effectiveSubmit * float64(running) / consumeMed)
+			if qTarget > target {
+				target = qTarget
+			}
+		}
+	}
+
+	if target > p.capacity {
+		target = p.capacity
+	}
+	if target <= running {
+		return
+	}
+
+	toSpawn := target - running
+
+	// Compensate for goroutines that will exit during the next scaler tick.
+	// Scale exitMed (per-sample-window) to scaler-period units.
+	exitPerTick := int64(exitMed * float64(p.config.scalerPeriod) / float64(p.config.statsSamplePeriod))
+	if exitPerTick > 0 {
+		toSpawn += exitPerTick
+	}
+
+	// Bounding checks
+	maxSpawn := p.capacity - running
+	if toSpawn > maxSpawn {
+		toSpawn = maxSpawn
+	}
+	if toSpawn <= 0 {
+		return
+	}
+
+	p.lock.Lock()
+	// Re-check under lock for thread safety
+	currentRunning := atomic.LoadInt64(&p.runningWorkersNum)
+	actualSpawn := p.capacity - currentRunning
+	if toSpawn < actualSpawn {
+		actualSpawn = toSpawn
+	}
+	if actualSpawn <= 0 {
+		p.lock.Unlock()
+		return
+	}
+	p.addRunningWorkersNum(actualSpawn)
+	p.lock.Unlock()
+
+	p.muIdle.Lock()
+	for i := int64(0); i < actualSpawn; i++ {
+		// Reuse idle workers before allocating new ones.
+		w := p.idleWorks.Pop()
+		if w == nil {
+			w = p.workerPool.Get().(*worker)
+		}
+		p.muIdle.Unlock()
+		go w.run(nil)
+		p.muIdle.Lock()
+	}
+	p.muIdle.Unlock()
+}
+
+// getMedianRates returns the median value of each counters from the histogram
+// (per-statsSamplePeriod). Returns (submitMed, consumeMed, exitMed).
+func (p *Pool) getMedianRates() (submitMed, consumeMed, exitMed float64) {
+	p.statMu.Lock()
+	defer p.statMu.Unlock()
+	return p.submitHist.median(), p.consumeHist.median(), p.exitHist.median()
+}
+
+// scaler periodically checks whether the pool needs more goroutines to keep up
+// with the submission rate, and spawns them proactively.
+func (p *Pool) scaler() {
+	ticker := time.NewTicker(p.config.scalerPeriod)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			p.scaleIfNeeded()
+		case <-p.closePoolCn:
+			return
+		}
+	}
+}
+
+// func (p *Pool) scaleIfNeeded() {
+// 	submitMed, consumeMed, exitMed := p.getMedianRates()
+// 	running := atomic.LoadInt64(&p.runningWorkersNum)
+// 	queueDepth := int64(len(p.taskQueue))
+
+// 	var target int64
+
+// 	// Rate-based target: target = b / a = submitMed * running / consumeMed
+// 	if running > 0 && consumeMed > 0 && submitMed > 0 {
+// 		target = int64(submitMed * float64(running) / consumeMed)
+// 	}
+
+// 	// Queue-weighted target: treat backlog as additional incoming tasks.
+// 	// decayFactor controls how aggressively we drain the queue per tick
+// 	// (e.g. 0.3 means 30% of the queue is factored in as extra "submissions"
+// 	// each scaler tick, so deep backlogs keep the target elevated).
+// 	if queueDepth > 0 {
+// 		if running == 0 {
+// 			// Cold start: spawn enough to drain the backlog (up to capacity).
+// 			target = queueDepth
+// 		} else if consumeMed > 0 {
+// 			decayFactor := p.config.backlogDecayFactor
+// 			effectiveSubmit := submitMed + float64(queueDepth)*decayFactor
+// 			qTarget := int64(effectiveSubmit * float64(running) / consumeMed)
+// 			if qTarget > target {
+// 				target = qTarget
+// 			}
+// 		}
+// 	}
+
+// 	if target > p.capacity {
+// 		target = p.capacity
+// 	}
+// 	if target <= running {
+// 		return
+// 	}
+
+// 	toSpawn := target - running
+
+// 	// Compensate for goroutines that will exit during the next scaler tick.
+// 	// Scale exitMed (per-sample-window) to scaler-period units.
+// 	exitPerTick := int64(exitMed * float64(p.config.scalerPeriod) / float64(p.config.statsSamplePeriod))
+// 	if exitPerTick > 0 {
+// 		toSpawn += exitPerTick
+// 	}
+
+// 	// Bounding checks
+// 	maxSpawn := p.capacity - running
+// 	if toSpawn > maxSpawn {
+// 		toSpawn = maxSpawn
+// 	}
+// 	if toSpawn <= 0 {
+// 		return
+// 	}
+
+// 	p.lock.Lock()
+// 	// Re-check under lock for thread safety
+// 	currentRunning := atomic.LoadInt64(&p.runningWorkersNum)
+// 	actualSpawn := p.capacity - currentRunning
+// 	if toSpawn < actualSpawn {
+// 		actualSpawn = toSpawn
+// 	}
+// 	if actualSpawn <= 0 {
+// 		p.lock.Unlock()
+// 		return
+// 	}
+// 	p.addRunningWorkersNum(actualSpawn)
+// 	p.lock.Unlock()
+
+// 	p.muIdle.Lock()
+// 	for i := int64(0); i < actualSpawn; i++ {
+// 		// Reuse idle workers before allocating new ones.
+// 		w := p.idleWorks.Pop()
+// 		if w == nil {
+// 			w = p.workerPool.Get().(*worker)
+// 		}
+// 		p.muIdle.Unlock()
+// 		go w.run(nil)
+// 		p.muIdle.Lock()
+// 	}
+// 	p.muIdle.Unlock()
+// }
+
 // Close marks the pool as closed and stops its background cleaner goroutine.
 // After Close:
 //   - new Submit calls become no-ops (the task is dropped, no goroutine is started)
@@ -288,6 +551,11 @@ func (p *Pool) Close() {
 		return
 	}
 	defaultPool.CompareAndSwap(p, nil)
+
+	p.taskMu.Lock()
+	p.overflowClosed = true
+	p.taskMu.Unlock()
+
 	close(p.closePoolCn)
 }
 
